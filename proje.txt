@@ -1,0 +1,1406 @@
+import io
+from tkinter import *
+from tkinter import ttk
+from PIL import ImageTk, Image
+import tkinter.messagebox
+from tkinter.ttk import Treeview
+from pymongo.mongo_client import MongoClient
+from pymongo.errors import ServerSelectionTimeoutError
+from datetime import datetime
+from bson.objectid import ObjectId
+import urllib.parse
+import urllib.request
+from pymongo.mongo_client import MongoClient
+from pymongo.errors import ServerSelectionTimeoutError
+from bs4 import BeautifulSoup
+
+
+# Kitap veri çekme sınıfı
+class BookScraper:
+    # Oluşturucu
+    def __init__(self):
+        pass
+
+    # Verilen sayfanın formatlı soup halini al
+    def get_soup(self, webpage):
+        with urllib.request.urlopen(
+            webpage) as response: html_content = response.read()  # Siteye bağlan ve HTML verisini çek
+        return BeautifulSoup(html_content, "html.parser")  # Soup objesini döndür
+
+    # Verilen sayfanın içerisindeki kitapların URL'sini al
+    def get_book_urls(self, category_url):
+        # Sayfa adı üzerinden taban sayfayı al
+        parser = urllib.parse.urlparse(category_url)
+        root = parser.scheme + "://" + parser.hostname + "/catalogue/"
+
+        soup = self.get_soup(category_url)  # Verilen sayfanın soup objesini al
+        books = soup.findAll("li",
+                             {"class": "col-xs-6 col-sm-4 col-md-3 col-lg-3"})  # Formatlanmamış kitapları siteden al
+
+        urls = {}  # Kitaplar için URL sözlüğü
+        for i in books:  # Her formatlanmamış kitap için
+            name = str(i.find("h3").find("a").get("title")).strip()  # İsmi al
+            url = root + i.find("a").get("href")  # URL formatla ve al
+
+            urls[name] = url  # Veriyi sözlüğe ekle
+
+        return urls  # Sözlüğü döndür
+
+    # Verilen kitap sayfası içerisinden kitap bilgilerini al
+    def parse_book(self, book_url):
+        # Sayfa adı üzerinden taban sayfayı al
+        parser = urllib.parse.urlparse(book_url)
+        root = parser.scheme + "://" + parser.hostname
+
+        soup = self.get_soup(book_url)  # Verilen sayfanın soup objesini al
+
+        with urllib.request.urlopen(root + soup.find("div", {"class": "item active"}).find("img")["src"][
+                                           5:]) as response: image = response.read()  # Kapak fotoğrafını al
+        name = soup.find("div", {"class": "col-sm-6 product_main"}).find("h1").text  # İsmi al
+
+        info_raw = soup.find("table", {"class": "table table-striped"})  # Bilgiler tablosunun işlenmemiş halini al
+
+        info_keys = info_raw.findAll("th")  # Tablo anahtarları
+        info_values = info_raw.findAll("td")  # Tablo verileri
+
+        category = soup.find("ul", {"class": "breadcrumb"}).findAll("li")[2].find("a").text  # Kategoriyi al
+
+        info = {}  # Kitaplar için bilgi sözlüğü
+
+        for i in range(len(info_keys)):  # Her tablo değeri için
+            info[info_keys[i].text] = info_values[i].text  # Verileri işle
+
+        stock = int(info["Availability"][10:info["Availability"].index(" ", 10)]) if "In stock" in info[
+            "Availability"] else 0  # Stok adedini al
+
+        all_info = {"upc": info["UPC"], "title": name, "img": image, "category": category,
+                    "price": float(info["Price (incl. tax)"][1:]),
+                    "stock": stock}  # Gerekli bilgileri bir sözlüğe topla
+        return all_info  # Bilgileri döndür
+
+    # Verilen sayfa sayısı kadar sayfa içerisinden bütün kitapları al
+    def get_books(self, page_count):
+        global books_db
+
+        books = []  # Kitap listesi
+        pages = ["https://books.toscrape.com/catalogue/page-{}.html".format(i) for i in
+                 range(1, page_count + 1)]  # Kitapları çekmek için sayfaları al
+        for i in pages:  # Her katalog sayfası için
+            book_urls = self.get_book_urls(i)  # Kitap URLlerini al
+
+            for j in book_urls.items():  # Her URL için
+                books.append(self.parse_book(j[1]))  # Kitap bilgilerini al ve listeye ekle
+
+        return books  # Kitap listesini döndür
+
+
+frames = {}  # GUI ekranları için sözlük
+
+# Her ekran için ekran birimi ölçüleri
+DIMENSIONS = {
+    "menu": (500, 700),
+    "scrape": (500, 225),
+    "list_all": (800, 800),
+    "add": (500, 500),
+    "delete": (500, 175),
+    "update": (500, 500),
+    "list_users": (800, 800),
+    "add_user": (500, 225),
+    "delete_user": (500, 175),
+    "list_borrowed": (800, 800),
+    "lend": (500, 225),
+    "return": (500, 175)
+}
+
+DB_URL = 'mongodb://localhost:27017/'  # Veritabanı sunucu adresi
+
+SCRAPER = BookScraper()  # Veri çekici
+
+
+# Veritabanına bağlan ve tabloları al
+def assert_database():
+    global client
+
+    # Veritabanına bağlanmaya çalış, bağlanamazsan programı kapat
+    try:
+        client = MongoClient(DB_URL, serverSelectionTimeoutMS=1)
+        client.server_info()
+    except ServerSelectionTimeoutError:
+        print("Veritabanina baglanilamadi. Program kapatiliyor...")
+        exit(1)
+
+    # Kütüphane veritabanını al
+    global db
+    db = client["library"]
+
+    # Kitap tablosunu al
+    global books_db
+    books_db = db["books"]
+
+    # Ödünç alınan kitap tablosunu al
+    global borrowed_db
+    borrowed_db = db["borrowed"]
+
+    # Kullanıcı tablosunu al
+    global users_db
+    users_db = db["users"]
+
+
+# Programı ve ekranları oluştur
+def start():
+    assert_database()  # Veritabanını kontrol et
+
+    # GUI'ı oluştur
+    global gui
+    gui = Tk()
+    gui.title("Kütüphane Paneli")
+    gui.resizable(False, False)
+
+    # Ekranları oluştur
+    frames["scrape"] = Frame(gui)
+    frames["menu"] = Frame(gui)
+    frames["list_all"] = Frame(gui)
+    frames["add"] = Frame(gui)
+    frames["delete"] = Frame(gui)
+    frames["update"] = Frame(gui)
+    frames["list_users"] = Frame(gui)
+    frames["add_user"] = Frame(gui)
+    frames["delete_user"] = Frame(gui)
+    frames["list_borrowed"] = Frame(gui)
+    frames["lend"] = Frame(gui)
+    frames["return"] = Frame(gui)
+
+    # Ekran içeriklerini tanımla
+    init_menu()
+    init_scrape()
+    init_list_all()
+    init_add_book()
+    init_delete_book()
+    init_update_book()
+    init_list_users()
+    init_add_user()
+    init_delete_user()
+    init_list_borrowed()
+    init_lend_book()
+    init_return_book()
+
+    # Ana menüyü göster ve GUI'ı başlat
+    raise_menu()
+    gui.mainloop()
+
+
+# Veri çekme ekranını oluştur
+def init_scrape():
+    global frames
+
+    inner_frame = Frame(frames["scrape"])  # Çerçeve oluştur
+
+    # Ana menüye dön butonu
+    go_back = Button(inner_frame, text="Ana Menüye Dön", command=raise_menu)
+    go_back.pack(expand=True, fill=X, padx=10, pady=10)
+
+    # Veri çekilecek sayfa yazısı
+    label = Label(inner_frame, text="Veri Çekilecek Sayfa Sayısı (1-50):")
+    label.pack(padx=10, pady=10, anchor=W)
+
+    # Veri çekilecek sayfa sayısı girişi
+    global scrape_var
+    scrape_var = IntVar()
+    entry = Entry(inner_frame, textvariable=scrape_var)
+    entry.pack(expand=True, fill=X, padx=10)
+
+    # Bilgi yazısı
+    label = Label(inner_frame,
+                  text="NOT: Bu operasyon veritabanındaki kitapları silip yenilerini ekler.\nVeri çekme işlemi uzun sürebilir. Lütfen bekleyiniz.")
+    label.pack(padx=10, pady=10)
+
+    # Veri çekme butonu
+    button = Button(inner_frame, text="Verileri Çek", command=scrape_books)
+    button.pack(expand=True, fill=X, padx=10, pady=10)
+
+    # Çerçeveyi ve ekranı yerleştir
+    inner_frame.pack(expand=True, fill=X)
+    frames["scrape"].place(x=0, y=0, width=DIMENSIONS["scrape"][0], height=DIMENSIONS["scrape"][1])
+
+
+# Ana menüyü oluştur
+def init_menu():
+    global frames
+
+    inner_frame = Frame(frames["menu"])  # Çerçeve oluştur
+
+    # Kitap verilerini çekme
+    scrape_button = Button(inner_frame, text="Kitap Verilerini Çek", command=reset_and_raise_scrape)
+    scrape_button.pack(expand=True, fill=BOTH, padx=10, pady=10)
+
+    # Kitapları listeleme
+    list_all_button = Button(inner_frame, text="Kitapları Listele", command=reset_and_raise_list_all)
+    list_all_button.pack(expand=True, fill=BOTH, padx=10, pady=10)
+
+    # Kitap ekleme
+    add_button = Button(inner_frame, text="El ile Kitap Ekle", command=reset_and_raise_add)
+    add_button.pack(expand=True, fill=BOTH, padx=10, pady=10)
+
+    # Kitap silme
+    delete_button = Button(inner_frame, text="Kitap Sil", command=reset_and_raise_delete)
+    delete_button.pack(expand=True, fill=BOTH, padx=10, pady=10)
+
+    # Kitap güncelleme
+    update_button = Button(inner_frame, text="Kitap Güncelle", command=reset_and_raise_update)
+    update_button.pack(expand=True, fill=BOTH, padx=10, pady=10)
+
+    # Kullanıcıları listeleme
+    list_users_button = Button(inner_frame, text="Kullanıcıları Listele", command=reset_and_raise_list_users)
+    list_users_button.pack(expand=True, fill=BOTH, padx=10, pady=10)
+
+    # Kullanıcı ekleme
+    add_user_button = Button(inner_frame, text="Kullanıcı Ekle", command=reset_and_raise_add_user)
+    add_user_button.pack(expand=True, fill=BOTH, padx=10, pady=10)
+
+    # Kullanıcı silme
+    delete_user_button = Button(inner_frame, text="Kullanıcı Sil", command=reset_and_raise_delete_user)
+    delete_user_button.pack(expand=True, fill=BOTH, padx=10, pady=10)
+
+    # Ödünç alınan kitapları listeleme
+    list_borrowed_button = Button(inner_frame, text="Ödünç Alınan Kitapları Listele",
+                                  command=reset_and_raise_list_borrowed)
+    list_borrowed_button.pack(expand=True, fill=BOTH, padx=10, pady=10)
+
+    # Kitap ödünç verme
+    lend_button = Button(inner_frame, text="Kitap Ödünç Ver", command=reset_and_raise_lend)
+    lend_button.pack(expand=True, fill=BOTH, padx=10, pady=10)
+
+    # Kitap geri alma
+    return_button = Button(inner_frame, text="Ödünç Verilen Kitap Geri Al", command=reset_and_raise_return)
+    return_button.pack(expand=True, fill=BOTH, padx=10, pady=10)
+
+    # Çerçeveyi ve ekranı yerleştir
+    inner_frame.pack(expand=True, fill=BOTH)
+    frames["menu"].place(x=0, y=0, width=DIMENSIONS["menu"][0], height=DIMENSIONS["menu"][1])
+
+
+# Kitap ekleme ekranını oluştur
+def init_add_book():
+    global frames
+
+    inner_frame = Frame(frames["add"])  # Çerçeve oluştur
+
+    # Ana menüye dön butonu
+    go_back = Button(inner_frame, text="Ana Menüye Dön", command=raise_menu)
+    go_back.pack(expand=True, fill=X, padx=10, pady=10)
+
+    # UPC kodu yazısı
+    upc_label = Label(inner_frame, text="UPC Kodu:")
+    upc_label.pack(padx=10, pady=10, anchor=W)
+
+    # UPC kodu girişi
+    global add_upc_var
+    add_upc_var = StringVar()
+    upc_entry = Entry(inner_frame, textvariable=add_upc_var)
+    upc_entry.pack(expand=True, fill=X, padx=10)
+
+    # Kapak URL'si yazısı
+    cover_label = Label(inner_frame, text="Kapak URL'si:")
+    cover_label.pack(padx=10, pady=10, anchor=W)
+
+    # Kapak URL'si girişi
+    global add_cover_var
+    add_cover_var = StringVar()
+    cover_entry = Entry(inner_frame, textvariable=add_cover_var)
+    cover_entry.pack(expand=True, fill=X, padx=10)
+
+    # Kitap ismi yazısı
+    title_label = Label(inner_frame, text="Kitap İsmi:")
+    title_label.pack(padx=10, pady=10, anchor=W)
+
+    # Kitap ismi girişi
+    global add_title_var
+    add_title_var = StringVar()
+    title_entry = Entry(inner_frame, textvariable=add_title_var)
+    title_entry.pack(expand=True, fill=X, padx=10)
+
+    # Kategori yazısı
+    category_label = Label(inner_frame, text="Kategori:")
+    category_label.pack(padx=10, pady=10, anchor=W)
+
+    # Kategori girişi
+    global add_category_var
+    add_category_var = StringVar()
+    category_entry = Entry(inner_frame, textvariable=add_category_var)
+    category_entry.pack(expand=True, fill=X, padx=10)
+
+    # Fiyat yazısı
+    price_label = Label(inner_frame, text="Fiyat:")
+    price_label.pack(padx=10, pady=10, anchor=W)
+
+    # Fiyat girişi
+    global add_price_var
+    add_price_var = DoubleVar()
+    price_entry = Entry(inner_frame, textvariable=add_price_var)
+    price_entry.pack(expand=True, fill=X, padx=10)
+
+    # Stok adedi yazısı
+    stock_label = Label(inner_frame, text="Stok Adedi:")
+    stock_label.pack(padx=10, pady=10, anchor=W)
+
+    # Stok adedi girişi
+    global add_stock_var
+    add_stock_var = IntVar()
+    stock_entry = Entry(inner_frame, textvariable=add_stock_var)
+    stock_entry.pack(expand=True, fill=X, padx=10)
+
+    # Kitap ekle butonu
+    button = Button(inner_frame, text="Kitap Ekle", command=add_book)
+    button.pack(expand=True, fill=X, padx=10, pady=10)
+
+    # Çerçeveyi ve ekranı yerleştir
+    inner_frame.pack(expand=True, fill=BOTH)
+    frames["add"].place(x=0, y=0, width=DIMENSIONS["add"][0], height=DIMENSIONS["add"][1])
+
+
+# Kitap güncelleme ekranını oluştur
+def init_update_book():
+    global frames
+
+    inner_frame = Frame(frames["update"])  # Çerçeve oluştur
+
+    # Ana menüye dön butonu
+    go_back = Button(inner_frame, text="Ana Menüye Dön", command=raise_menu)
+    go_back.pack(expand=True, fill=X, padx=10, pady=10)
+
+    # UPC kodu yazısı
+    upc_label = Label(inner_frame, text="Güncellenecek Kitabın UPC Kodu:")
+    upc_label.pack(padx=10, pady=10, anchor=W)
+
+    # UPC kodu girişi
+    global update_upc_var
+    update_upc_var = StringVar()
+    upc_entry = Entry(inner_frame, textvariable=update_upc_var)
+    upc_entry.pack(expand=True, fill=X, padx=10)
+
+    # Kitap ismi yazısı
+    title_label = Label(inner_frame, text="Kitap İsmi (değiştirmeyecekseniz boş bırakın):")
+    title_label.pack(padx=10, pady=10, anchor=W)
+
+    # Kitap ismi girişi
+    global update_title_var
+    update_title_var = StringVar()
+    title_entry = Entry(inner_frame, textvariable=update_title_var)
+    title_entry.pack(expand=True, fill=X, padx=10)
+
+    # Kategori yazısı
+    category_label = Label(inner_frame, text="Kategori (değiştirmeyecekseniz boş bırakın):")
+    category_label.pack(padx=10, pady=10, anchor=W)
+
+    # Kategori girişi
+    global update_category_var
+    update_category_var = StringVar()
+    category_entry = Entry(inner_frame, textvariable=update_category_var)
+    category_entry.pack(expand=True, fill=X, padx=10)
+
+    # Fiyat yazısı
+    price_label = Label(inner_frame, text="Fiyat (değiştirmeyecekseniz boş bırakın):")
+    price_label.pack(padx=10, pady=10, anchor=W)
+
+    # Fiyat girişi
+    global update_price_var
+    update_price_var = StringVar()
+    price_entry = Entry(inner_frame, textvariable=update_price_var)
+    price_entry.pack(expand=True, fill=X, padx=10)
+
+    # Stok adedi yazısı
+    stock_label = Label(inner_frame, text="Stok Adedi (değiştirmeyecekseniz boş bırakın):")
+    stock_label.pack(padx=10, pady=10, anchor=W)
+
+    # Stok adedi girişi
+    global update_stock_var
+    update_stock_var = StringVar()
+    stock_entry = Entry(inner_frame, textvariable=update_stock_var)
+    stock_entry.pack(expand=True, fill=X, padx=10)
+
+    # Kitap güncelle butonu
+    button = Button(inner_frame, text="Kitap Güncelle", command=update_book)
+    button.pack(expand=True, fill=X, padx=10, pady=10)
+
+    # Çerçeveyi ve ekranı yerleştir
+    inner_frame.pack(expand=True, fill=BOTH)
+    frames["update"].place(x=0, y=0, width=DIMENSIONS["update"][0], height=DIMENSIONS["update"][1])
+
+
+# Kitap listeleme ekranı
+def init_list_all():
+    global frames
+
+    inner_frame = Frame(frames["list_all"])  # Çerçeve oluştur
+    top_frame = Frame(inner_frame)  # İçine üst çerçeve oluştur
+    box = Frame(inner_frame)  # İçine alt çerçeve oluştur
+
+    # Ana menüye dön butonu
+    go_back = Button(top_frame, text="Ana Menüye Dön", command=raise_menu)
+    go_back.pack(expand=True, fill=X, padx=10, pady=10)
+
+    # Ara yazısı
+    label = Label(top_frame, text="Ara:")
+    label.pack(padx=10, pady=10, anchor=W)
+
+    # Arama çubuğu
+    global list_all_search_var
+    list_all_search_var = StringVar()
+    list_all_search_var.trace("w", lambda name, index, mode,
+                                          sv=list_all_search_var: fill_all())  # Giriş güncellendikçe listeyi yeniden doldur
+    bar = Entry(top_frame, textvariable=list_all_search_var)
+    bar.pack(expand=True, fill=X, padx=10)
+
+    # Kitap listesi ağacı
+    global all_tree
+    all_tree = Treeview(box, columns=["UPC Kodu", "Kitap İsmi", "Kategori", "Fiyat", "Stok Adedi"])
+    vsb = Scrollbar(box, orient="vertical", command=all_tree.yview)  # Dikey kaydırma çubuğu
+    hsb = Scrollbar(box, orient="horizontal", command=all_tree.xview)  # Yatay kaydırma çubuğu
+    all_tree.configure(yscrollcommand=vsb.set, xscrollcommand=hsb.set)
+    vsb.pack(side=RIGHT, fill=Y)
+    hsb.pack(side=BOTTOM, fill=X)
+    all_tree.configure(selectmode="none")
+    all_tree.pack(expand=True, fill=BOTH)
+
+    # Çerçeveleri ve ekranı yerleştir
+    top_frame.pack(fill=X, side=TOP)
+    box.pack(expand=True, fill=BOTH, padx=10, pady=10, side=BOTTOM)
+    inner_frame.pack(expand=True, fill=BOTH)
+    frames["list_all"].place(x=0, y=0, width=DIMENSIONS["list_all"][0], height=DIMENSIONS["list_all"][1])
+
+
+# Ödünç alınan kitap listeleme ekranı
+def init_list_borrowed():
+    global frames
+
+    inner_frame = Frame(frames["list_borrowed"])  # Çerçeve oluştur
+    top_frame = Frame(inner_frame)  # İçine üst çerçeve oluştur
+    box = Frame(inner_frame)  # İçine alt çerçeve oluştur
+
+    # Ana menüye dön butonu
+    go_back = Button(top_frame, text="Ana Menüye Dön", command=raise_menu)
+    go_back.pack(expand=True, fill=X, padx=10, pady=10)
+
+    # Ara yazısı
+    label = Label(top_frame, text="Ara:")
+    label.pack(padx=10, pady=10, anchor=W)
+
+    # Arama çubuğu
+    global list_borrowed_search_var
+    list_borrowed_search_var = StringVar()
+    list_borrowed_search_var.trace("w", lambda name, index, mode,
+                                               sv=list_borrowed_search_var: fill_borrowed())  # Giriş güncellendikçe listeyi yeniden doldur
+    bar = Entry(top_frame, textvariable=list_borrowed_search_var)
+    bar.pack(expand=True, fill=X, padx=10)
+
+    # Ödünç alınan kitap listesi ağacı
+    global borrowed_tree
+    borrowed_tree = Treeview(box, columns=["Ödünç ID'si", "Ödünç Alan", "UPC Kodu", "Ödünç Tarihi"], show="headings")
+    vsb = Scrollbar(box, orient="vertical", command=borrowed_tree.yview)  # Dikey kaydırma çubuğu
+    hsb = Scrollbar(box, orient="horizontal", command=borrowed_tree.xview)  # Yatay kaydırma çubuğu
+    borrowed_tree.configure(yscrollcommand=vsb.set, xscrollcommand=hsb.set)
+    vsb.pack(side=RIGHT, fill=Y)
+    hsb.pack(side=BOTTOM, fill=X)
+    borrowed_tree.configure(selectmode="none")
+    borrowed_tree.pack(expand=True, fill=BOTH)
+
+    # Çerçeveleri ve ekranı yerleştir
+    top_frame.pack(fill=X, side=TOP)
+    box.pack(expand=True, fill=BOTH, padx=10, pady=10, side=BOTTOM)
+    inner_frame.pack(expand=True, fill=BOTH)
+    frames["list_borrowed"].place(x=0, y=0, width=DIMENSIONS["list_borrowed"][0], height=DIMENSIONS["list_borrowed"][1])
+
+
+# Kitap ödünç verme ekranı
+def init_lend_book():
+    global frames
+
+    inner_frame = Frame(frames["lend"])  # Çerçeve oluştur
+
+    # Ana menüye dön butonu
+    go_back = Button(inner_frame, text="Ana Menüye Dön", command=raise_menu)
+    go_back.pack(expand=True, fill=X, padx=10, pady=10)
+
+    # UPC kodu yazısı
+    upc_label = Label(inner_frame, text="UPC Kodu:")
+    upc_label.pack(padx=10, pady=10, anchor=W)
+
+    # UPC kodu girişi
+    global lend_upc_var
+    lend_upc_var = StringVar()
+    upc_entry = Entry(inner_frame, textvariable=lend_upc_var)
+    upc_entry.pack(expand=True, fill=X, padx=10)
+
+    # Ödünç alanın kullanıcı adı yazısı
+    borrower_label = Label(inner_frame, text="Ödünç Alanın Kullanıcı Adı:")
+    borrower_label.pack(padx=10, pady=10, anchor=W)
+
+    # Ödünç alanın kullanıcı adı girişi
+    global lend_borrower_var
+    lend_borrower_var = StringVar()
+    borrower_entry = Entry(inner_frame, textvariable=lend_borrower_var)
+    borrower_entry.pack(expand=True, fill=X, padx=10)
+
+    # Ödünç ver butonu
+    button = Button(inner_frame, text="Ödünç Ver", command=lend_book)
+    button.pack(expand=True, fill=X, padx=10, pady=10)
+
+    # Çerçeveyi ve ekranı yerleştir
+    inner_frame.pack(expand=True, fill=X)
+    frames["lend"].place(x=0, y=0, width=DIMENSIONS["lend"][0], height=DIMENSIONS["lend"][1])
+
+
+# Kullanıcı ekleme ekranını oluştur
+def init_add_user():
+    global frames
+
+    inner_frame = Frame(frames["add_user"])  # Çerçeve oluştur
+
+    # Ana menüye dön butonu
+    go_back = Button(inner_frame, text="Ana Menüye Dön", command=raise_menu)
+    go_back.pack(expand=True, fill=X, padx=10, pady=10)
+
+    # Kullanıcı adı yazısı
+    label = Label(inner_frame, text="Kullanıcı Adı:")
+    label.pack(padx=10, pady=10, anchor=W)
+
+    # Kullanıcı adı girişi
+    global add_user_username_var
+    add_user_username_var = StringVar()
+    entry = Entry(inner_frame, textvariable=add_user_username_var)
+    entry.pack(expand=True, fill=X, padx=10)
+
+    # Tam isim yazısı
+    label = Label(inner_frame, text="Tam İsim:")
+    label.pack(padx=10, pady=10, anchor=W)
+
+    # Tam isim girişi
+    global add_user_fullname_var
+    add_user_fullname_var = StringVar()
+    entry = Entry(inner_frame, textvariable=add_user_fullname_var)
+    entry.pack(expand=True, fill=X, padx=10)
+
+    # Kullanıcı ekle butonu
+    button = Button(inner_frame, text="Kullanıcı Ekle", command=add_user)
+    button.pack(expand=True, fill=X, padx=10, pady=10)
+
+    # Çerçeveyi ve ekranı yerleştir
+    inner_frame.pack(expand=True, fill=X)
+    frames["add_user"].place(x=0, y=0, width=DIMENSIONS["add_user"][0], height=DIMENSIONS["add_user"][1])
+
+
+# Kullanıcı silme ekranı
+def init_delete_user():
+    global frames
+
+    inner_frame = Frame(frames["delete_user"])  # Çerçeve oluştur
+
+    # Ana menüye dön butonu
+    go_back = Button(inner_frame, text="Ana Menüye Dön", command=raise_menu)
+    go_back.pack(expand=True, fill=X, padx=10, pady=10)
+
+    # Kullanıcı adı yazısı
+    label = Label(inner_frame, text="Kullanıcı Adı:")
+    label.pack(padx=10, pady=10, anchor=W)
+
+    # Kullanıcı adı girişi
+    global delete_user_var
+    delete_user_var = StringVar()
+    entry = Entry(inner_frame, textvariable=delete_user_var)
+    entry.pack(expand=True, fill=X, padx=10)
+
+    # Kullanıcı sil butonu
+    button = Button(inner_frame, text="Kullanıcı Sil", command=delete_user)
+    button.pack(expand=True, fill=X, padx=10, pady=10)
+
+    # Çerçeveyi ve ekranı yerleştir
+    inner_frame.pack(expand=True, fill=X)
+    frames["delete_user"].place(x=0, y=0, width=DIMENSIONS["delete_user"][0], height=DIMENSIONS["delete_user"][1])
+
+
+# Kullanıcı listeleme ekranını oluştur
+def init_list_users():
+    global frames
+
+    inner_frame = Frame(frames["list_users"])  # Çerçeve oluştur
+    top_frame = Frame(inner_frame)  # İçine üst çerçeve oluştur
+    box = Frame(inner_frame)  # İçine alt çerçeve oluştur
+
+    # Ana menüye dön butonu
+    go_back = Button(top_frame, text="Ana Menüye Dön", command=raise_menu)
+    go_back.pack(expand=True, fill=X, padx=10, pady=10)
+
+    # Ara yazısı
+    label = Label(top_frame, text="Ara:")
+    label.pack(padx=10, pady=10, anchor=W)
+
+    # Arama çubuğu
+    global list_users_search_var
+    list_users_search_var = StringVar()
+    list_users_search_var.trace("w", lambda name, index, mode,
+                                            sv=list_users_search_var: fill_users())  # Giriş güncellendikçe listeyi yeniden doldur
+    bar = Entry(top_frame, textvariable=list_users_search_var)
+    bar.pack(expand=True, fill=X, padx=10)
+
+    # Kullanıcı listesi ağacı
+    global users_tree
+    users_tree = Treeview(box, columns=["Kullanıcı Adı", "Tam İsim", "Kayıt Tarihi"], show="headings")
+    vsb = Scrollbar(box, orient="vertical", command=users_tree.yview)  # Dikey kaydırma çubuğu
+    hsb = Scrollbar(box, orient="horizontal", command=users_tree.xview)  # Yatay kaydırma çubuğu
+    users_tree.configure(yscrollcommand=vsb.set, xscrollcommand=hsb.set)
+    vsb.pack(side=RIGHT, fill=Y)
+    hsb.pack(side=BOTTOM, fill=X)
+    users_tree.configure(selectmode="none")
+    users_tree.pack(expand=True, fill=BOTH)
+
+    # Çerçeveleri ve ekranı yerleştir
+    top_frame.pack(fill=X, side=TOP)
+    box.pack(expand=True, fill=BOTH, padx=10, pady=10, side=BOTTOM)
+    inner_frame.pack(expand=True, fill=BOTH)
+    frames["list_users"].place(x=0, y=0, width=DIMENSIONS["list_users"][0], height=DIMENSIONS["list_users"][1])
+
+
+# Ödünç alınan kitabı geri alma ekranını oluştur
+def init_return_book():
+    global frames
+
+    inner_frame = Frame(frames["return"])  # Çerçeve oluştur
+
+    # Ana menüye dön butonu
+    go_back = Button(inner_frame, text="Ana Menüye Dön", command=raise_menu)
+    go_back.pack(expand=True, fill=X, padx=10, pady=10)
+
+    # Ödünç ID'si yazısı
+    label = Label(inner_frame, text="Ödünç ID'si:")
+    label.pack(padx=10, pady=10, anchor=W)
+
+    # Ödünç ID'si girişi
+    global return_var
+    return_var = StringVar()
+    entry = Entry(inner_frame, textvariable=return_var)
+    entry.pack(expand=True, fill=X, padx=10)
+
+    # Geri al butonu
+    button = Button(inner_frame, text="Geri Al", command=return_book)
+    button.pack(expand=True, fill=X, padx=10, pady=10)
+
+    # Çerçeveyi ve ekranı yerleştir
+    inner_frame.pack(expand=True, fill=X)
+    frames["return"].place(x=0, y=0, width=DIMENSIONS["return"][0], height=DIMENSIONS["return"][1])
+
+
+# Kitap silme ekranı
+def init_delete_book():
+    global frames
+
+    inner_frame = Frame(frames["delete"])  # Çerçeve oluştur
+
+    # Ana menüye dön butonu
+    go_back = Button(inner_frame, text="Ana Menüye Dön", command=raise_menu)
+    go_back.pack(expand=True, fill=X, padx=10, pady=10)
+
+    # UPC kodu yazısı
+    label = Label(inner_frame, text="UPC Kodu:")
+    label.pack(padx=10, pady=10, anchor=W)
+
+    # UPC kodu girişi
+    global delete_var
+    delete_var = StringVar()
+    entry = Entry(inner_frame, textvariable=delete_var)
+    entry.pack(expand=True, fill=X, padx=10)
+
+    # Kitap silme butonu
+    button = Button(inner_frame, text="Kitap Sil", command=delete_book)
+    button.pack(expand=True, fill=X, padx=10, pady=10)
+
+    # Çerçeveyi ve ekranı yerleştir
+    inner_frame.pack(expand=True, fill=X)
+    frames["delete"].place(x=0, y=0, width=DIMENSIONS["delete"][0], height=DIMENSIONS["delete"][1])
+
+
+# Ana menüyü aç
+def raise_menu():
+    global frames
+    global gui
+
+    gui.geometry(str(DIMENSIONS["menu"][0]) + "x" + str(DIMENSIONS["menu"][1]))  # Ekran boyutunu ayarla
+    frames["menu"].tkraise()  # Ekranı öne çıkar
+
+
+# Veri çekme ekranını aç
+def reset_and_raise_scrape():
+    global frames
+    global gui
+    global scrape_var
+
+    gui.geometry(str(DIMENSIONS["scrape"][0]) + "x" + str(DIMENSIONS["scrape"][1]))  # Ekran boyutunu ayarla
+    # Girişleri sıfırla
+    scrape_var.set(1)
+    frames["scrape"].tkraise()  # Ekranı öne çıkar
+
+
+# Kitap ekleme ekranını aç
+def reset_and_raise_add():
+    global frames
+    global add_upc_var
+    global add_cover_var
+    global add_title_var
+    global add_category_var
+    global add_price_var
+    global add_stock_var
+
+    gui.geometry(str(DIMENSIONS["add"][0]) + "x" + str(DIMENSIONS["add"][1]))  # Ekran boyutunu ayarla
+    # Girişleri sıfırla
+    add_upc_var.set("")
+    add_cover_var.set("")
+    add_title_var.set("")
+    add_category_var.set("")
+    add_price_var.set(0.0)
+    add_stock_var.set(0)
+    frames["add"].tkraise()  # Ekranı öne çıkar
+
+
+# Kitap silme ekranını aç
+def reset_and_raise_delete():
+    global frames
+    global gui
+    global delete_var
+
+    gui.geometry(str(DIMENSIONS["delete"][0]) + "x" + str(DIMENSIONS["delete"][1]))  # Ekran boyutunu ayarla
+    # Girişleri sıfırla
+    delete_var.set("")
+    frames["delete"].tkraise()  # Ekranı öne çıkar
+
+
+# Kitap güncelleme ekranını aç
+def reset_and_raise_update():
+    global frames
+    global update_upc_var
+    global update_title_var
+    global update_category_var
+    global update_price_var
+    global update_stock_var
+
+    gui.geometry(str(DIMENSIONS["update"][0]) + "x" + str(DIMENSIONS["update"][1]))  # Ekran boyutunu ayarla
+    # Girişleri sıfırla
+    update_upc_var.set("")
+    update_title_var.set("")
+    update_category_var.set("")
+    update_price_var.set("")
+    update_stock_var.set("")
+    frames["update"].tkraise()  # Ekranı öne çıkar
+
+
+# Kullanıcı listeleme ekranını aç
+def reset_and_raise_list_users():
+    global frames
+    global list_users_search_var
+    global users_tree
+
+    gui.geometry(str(DIMENSIONS["list_users"][0]) + "x" + str(DIMENSIONS["list_users"][1]))  # Ekran boyutunu ayarla
+    # Girişleri sıfırla
+    list_users_search_var.set("")
+    # Kaydırma çubuklarını en başa getir
+    users_tree.xview_moveto(0)
+    users_tree.yview_moveto(0)
+    # Satır yüksekliğini ayarla
+    s = ttk.Style()
+    s.configure('Treeview', rowheight=20)
+    fill_users()  # Verileri doldur
+    frames["list_users"].tkraise()  # Ekranı öne çıkar
+
+
+# Kullanıcı ekleme ekranını aç
+def reset_and_raise_add_user():
+    global frames
+    global add_user_username_var
+    global add_user_fullname_var
+
+    gui.geometry(str(DIMENSIONS["add_user"][0]) + "x" + str(DIMENSIONS["add_user"][1]))  # Ekran boyutunu ayarla
+    # Girişleri sıfırla
+    add_user_username_var.set("")
+    add_user_fullname_var.set("")
+    frames["add_user"].tkraise()  # Ekranı öne çıkar
+
+
+# Kullanıcı silme ekranını aç
+def reset_and_raise_delete_user():
+    global frames
+    global delete_user_var
+
+    gui.geometry(str(DIMENSIONS["delete_user"][0]) + "x" + str(DIMENSIONS["delete_user"][1]))  # Ekran boyutunu ayarla
+    # Girişleri sıfırla
+    delete_user_var.set("")
+    frames["delete_user"].tkraise()  # Ekranı öne çıkar
+
+
+# Kitap ödünç verme ekranını aç
+def reset_and_raise_lend():
+    global frames
+    global lend_upc_var
+    global lend_borrower_var
+
+    gui.geometry(str(DIMENSIONS["lend"][0]) + "x" + str(DIMENSIONS["lend"][1]))  # Ekran boyutunu ayarla
+    # Girişleri sıfırla
+    lend_upc_var.set("")
+    lend_borrower_var.set("")
+    frames["lend"].tkraise()  # Ekranı öne çıkar
+
+
+# Ödünç verilen kitap geri alma ekranını aç
+def reset_and_raise_return():
+    global frames
+    global return_var
+
+    gui.geometry(str(DIMENSIONS["return"][0]) + "x" + str(DIMENSIONS["return"][1]))  # Ekran boyutunu ayarla
+    # Girişleri sıfırla
+    return_var.set("")
+    frames["return"].tkraise()  # Ekranı öne çıkar
+
+
+# Kitap listeleme ekranını aç
+def reset_and_raise_list_all():
+    global frames
+    global list_all_search_var
+    global all_tree
+
+    gui.geometry(str(DIMENSIONS["list_all"][0]) + "x" + str(DIMENSIONS["list_all"][1]))  # Ekran boyutunu ayarla
+    # Girişleri sıfırla
+    list_all_search_var.set("")
+    # Kaydırma çubuklarını en başa getir
+    all_tree.xview_moveto(0)
+    all_tree.yview_moveto(0)
+    # Satır yüksekliğini ayarla
+    s = ttk.Style()
+    s.configure('Treeview', rowheight=100)
+    fill_all()  # Verileri doldur
+    frames["list_all"].tkraise()  # Ekranı öne çıkar
+
+
+# Ödünç alınan kitapları listeleme ekranını aç
+def reset_and_raise_list_borrowed():
+    global frames
+    global list_borrowed_search_var
+    global borrowed_tree
+
+    gui.geometry(
+        str(DIMENSIONS["list_borrowed"][0]) + "x" + str(DIMENSIONS["list_borrowed"][1]))  # Ekran boyutunu ayarla
+    # Girişleri sıfırla
+    list_borrowed_search_var.set("")
+    # Kaydırma çubuklarını en başa getir
+    borrowed_tree.xview_moveto(0)
+    borrowed_tree.yview_moveto(0)
+    # Satır yüksekliğini ayarla
+    s = ttk.Style()
+    s.configure('Treeview', rowheight=20)
+    fill_borrowed()  # Verileri doldur
+    frames["list_borrowed"].tkraise()  # Ekranı öne çıkar
+
+
+# Bütün kitaplar listesini doldur
+def fill_all():
+    global all_tree
+    global books_db
+    global list_all_search_var
+
+    # Ağaç içindeki kitapları sil
+    for i in all_tree.get_children():
+        all_tree.delete(i)
+
+    headers = [("UPC Kodu", 150), ("Kitap İsmi", 150), ("Kategori", 150), ("Fiyat", 100),
+               ("Stok Adedi", 100)]  # Ağaç başlıkları ve boyutları
+
+    # Başlıkları yerleştir
+    for i in range(len(headers)):
+        all_tree.heading(headers[i][0], text=headers[i][0])
+        all_tree.column(headers[i][0], width=headers[i][1], stretch=NO, anchor=CENTER, minwidth=100)
+
+    bar = list_all_search_var.get().strip().casefold()  # Arama çubuğundaki veriyi al
+
+    data = []  # Ağaca eklenecek veriler
+
+    books = books_db.find({}, {"_id": 0})  # Veritabanından kitapları al
+
+    for item in books:  # Her kitap için
+        i = [item["img"], item["upc"], item["title"], item["category"], item["price"],
+             item["stock"]]  # Kitap verisini oluştur
+
+        # Eğer arama çubuğunda yazan yazı UPC kodu içerisinde varsa veriyi listeye ekle ve sonraki kitaba geç
+        if bar in item["upc"].casefold():
+            data.append(i)
+            continue
+
+        # Eğer arama çubuğunda yazan yazı kitap ismi içerisinde varsa veriyi listeye ekle ve sonraki kitaba geç
+        if bar in item["title"].casefold():
+            data.append(i)
+            continue
+
+        # Eğer arama çubuğunda yazan yazı kategori içerisinde varsa veriyi listeye ekle ve sonraki kitaba geç
+        if bar in item["category"].casefold():
+            data.append(i)
+            continue
+
+        # Eğer arama çubuğunda yazan yazı fiyat içerisinde varsa veriyi listeye ekle ve sonraki kitaba geç
+        if bar in str(item["price"]):
+            data.append(i)
+            continue
+
+        # Eğer arama çubuğunda yazan yazı stok adedi içerisinde varsa veriyi listeye ekle ve sonraki kitaba geç
+        if bar in str(item["stock"]):
+            data.append(i)
+            continue
+
+    all_tree._images = []  # Ağaç içerisinde bir kitap listesi oluştur
+
+    for i in range(len(data)):  # Eklenen her veri için
+        # Kapak resmi verisini al
+        item = data[i]
+        img = item[0]
+        item.pop(0)
+
+        # Resmi oluşturup listeye ekle
+        all_tree._image = Image.open(io.BytesIO(img))
+        all_tree._image.thumbnail((50, 100), Image.ANTIALIAS)
+        all_tree._image = ImageTk.PhotoImage(all_tree._image)
+        all_tree._images.append(all_tree._image)
+
+        # Veriyi kapak resmi ile beraber ağaca ekle
+        all_tree.insert('', 'end', image=all_tree._images[-1], values=item)
+
+
+# Ödünç alınan kitaplar listesini doldur
+def fill_borrowed():
+    global borrowed_tree
+    global list_borrowed_search_var
+
+    # Ağaç içindeki verileri sil
+    for i in borrowed_tree.get_children():
+        borrowed_tree.delete(i)
+
+    headers = [("Ödünç ID'si", 180), ("Ödünç Alan", 150), ("UPC Kodu", 150),
+               ("Ödünç Tarihi", 150)]  # Ağaç başlıkları ve boyutları
+
+    # Başlıkları yerleştir
+    for i in range(len(headers)):
+        borrowed_tree.heading(headers[i][0], text=headers[i][0])
+        borrowed_tree.column(headers[i][0], width=headers[i][1], stretch=NO, anchor=CENTER, minwidth=150)
+
+    bar = list_borrowed_search_var.get().strip().casefold()  # Arama çubuğundaki veriyi al
+
+    data = []  # Ağaca eklenecek veriler
+
+    borrowed_books = borrowed_db.find({})  # Veritabanından ödünç alınan kitapları al
+
+    for item in borrowed_books:  # Her veri için
+        i = [str(item["_id"]), item["borrower"], item["upc"], item["date"]]  # Ödünç alma verisini oluştur
+
+        # Eğer arama çubuğunda yazan yazı ödünç ID'si içerisinde varsa veriyi listeye ekle ve sonraki veriye geç
+        if bar in str(item["_id"]).casefold():
+            data.append(i)
+            continue
+
+        # Eğer arama çubuğunda yazan yazı ödünç alan içerisinde varsa veriyi listeye ekle ve sonraki veriye geç
+        if bar in item["borrower"].casefold():
+            data.append(i)
+            continue
+
+        # Eğer arama çubuğunda yazan yazı UPC kodu içerisinde varsa veriyi listeye ekle ve sonraki veriye geç
+        if bar in item["upc"].casefold():
+            data.append(i)
+            continue
+
+        # Eğer arama çubuğunda yazan yazı ödünç tarihi içerisinde varsa veriyi listeye ekle ve sonraki veriye geç
+        if bar in item["date"].casefold():
+            data.append(i)
+            continue
+
+    # Bulunan verileri ağaca ekle
+    for item in data:
+        borrowed_tree.insert('', 'end', values=item)
+
+
+# Kullanıcı listesini doldur
+def fill_users():
+    global users_tree
+    global list_users_search_var
+
+    # Ağaç içindeki verileri sil
+    for i in users_tree.get_children():
+        users_tree.delete(i)
+
+    headers = [("Kullanıcı Adı", 150), ("Tam İsim", 250), ("Kayıt Tarihi", 150)]  # Ağaç başlıkları ve boyutları
+
+    # Başlıkları yerleştir
+    for i in range(len(headers)):
+        users_tree.heading(headers[i][0], text=headers[i][0])
+        users_tree.column(headers[i][0], width=headers[i][1], stretch=NO, anchor=CENTER, minwidth=150)
+
+    bar = list_users_search_var.get().strip().casefold()  # Arama çubuğundaki veriyi al
+
+    data = []  # Ağaca eklenecek veriler
+
+    users = users_db.find({})  # Veritabanından kullanıcıları al
+
+    for item in users:  # Her kullanıcı için
+        i = [item["username"], item["fullname"], item["date"]]  # Kullanıcı verisini oluştur
+
+        # Eğer arama çubuğunda yazan yazı kullanıcı adı içerisinde varsa veriyi listeye ekle ve sonraki kullanıcıya geç
+        if bar in item["username"].casefold():
+            data.append(i)
+            continue
+
+        # Eğer arama çubuğunda yazan yazı tam isim içerisinde varsa veriyi listeye ekle ve sonraki kullanıcıya geç
+        if bar in item["fullname"].casefold():
+            data.append(i)
+            continue
+
+        # Eğer arama çubuğunda yazan yazı kayıt tarihi içerisinde varsa veriyi listeye ekle ve sonraki kullanıcıya geç
+        if bar in item["date"].casefold():
+            data.append(i)
+            continue
+
+    # Bulunan verileri ağaca ekle
+    for item in data:
+        users_tree.insert('', 'end', values=item)
+
+
+# Kitap verilerini çek
+def scrape_books():
+    global books_db
+    global borrowed_db
+    global scrape_var
+
+    # Sayfa sayısı sayı değilse hata ver
+    try:
+        page_count = scrape_var.get()
+    except:
+        tkinter.messagebox.showerror(title="Geçersiz değerler.",
+                                     message="Lütfen bütün alanlara geçerli değerler giriniz.")
+        return
+
+    # Sayfa sayısı geçersizse hata ver
+    if page_count < 1 or page_count > 50:
+        tkinter.messagebox.showerror(title="Geçersiz değerler.",
+                                     message="Lütfen bütün alanlara geçerli değerler giriniz.")
+        return
+
+    # Bütün kitapları sil, kitapları çek, çekilen kitapları veritabanına ekle ve bilgi mesajı göster
+    borrowed_db.delete_many({})
+    books_db.delete_many({})
+    books = SCRAPER.get_books(page_count)
+    books_db.insert_many(books)
+    tkinter.messagebox.showinfo(title="Çekildi.", message="{} sayfa kitap verisi başarıyla çekildi.".format(page_count))
+
+
+# Kitap ekle
+def add_book():
+    global books_db
+    global add_upc_var
+    global add_cover_var
+    global add_title_var
+    global add_category_var
+    global add_price_var
+    global add_stock_var
+
+    # Stok adedi ve fiyat sayı değilse hata ver
+    try:
+        stock = add_stock_var.get()
+        price = add_price_var.get()
+    except:
+        tkinter.messagebox.showerror(title="Geçersiz değerler.",
+                                     message="Lütfen bütün alanlara geçerli değerler giriniz.")
+        return
+
+    # Diğer verileri girişlerden al
+    upc = add_upc_var.get().strip()
+    cover = add_cover_var.get().strip()
+    category = add_category_var.get().strip()
+    title = add_title_var.get().strip()
+
+    # Eğer veriler geçersizse hata ver
+    if upc == "" or cover == "" or title == "" or category == "" or stock < 0 or price < 0:
+        tkinter.messagebox.showerror(title="Geçersiz değerler.",
+                                     message="Lütfen bütün alanlara geçerli değerler giriniz.")
+        return
+
+    upcs = [i["upc"] for i in books_db.find({}, {"upc": 1, "_id": 0})]  # Bütün UPC kodlarını al
+
+    # Eğer girilen UPC zaten varsa hata ver
+    if upc in upcs:
+        tkinter.messagebox.showerror(title="Geçersiz değerler.", message="Zaten bu UPC kodu ile bir kitap var.")
+        return
+
+    # Kapak fotosu verisini al, alamazsa hata ver
+    try:
+        with urllib.request.urlopen(cover) as response:
+            image = response.read()
+    except:
+        tkinter.messagebox.showerror(title="Geçersiz değerler.", message="Geçersiz bir kapak URL'si girdiniz.")
+        return
+
+    # Kitabı veritabanına ekle ve bilgi mesajı göster
+    books_db.insert_one(
+        {"upc": upc, "title": title, "img": image, "category": category, "price": price, "stock": stock})
+    tkinter.messagebox.showinfo(title="Eklendi.", message="Kitap başarıyla eklendi.")
+
+
+# Kitap güncelle
+def update_book():
+    global books_db
+    global update_upc_var
+    global update_title_var
+    global update_category_var
+    global update_price_var
+    global update_stock_var
+
+    upc = update_upc_var.get().strip()  # UPC kodunu al
+
+    # Eğer UPC kodu boşsa hata ver
+    if upc == "":
+        tkinter.messagebox.showerror(title="Geçersiz değerler.", message="Lütfen geçerli bir UPC kodu giriniz.")
+        return
+
+    upcs = [i["upc"] for i in books_db.find({}, {"upc": 1, "_id": 0})]  # Bütün UPC kodlarını al
+
+    # Eğer girilen UPC'ye sahip kitap yoksa hata ver
+    if upc not in upcs:
+        tkinter.messagebox.showerror(title="Geçersiz değerler.",
+                                     message="Girilen UPC koduna sahip bir kitap bulunamadı.")
+        return
+
+    price_str = update_price_var.get().strip()  # Fiyatı al
+
+    # Fiyat boş değilse sayıya dönüştür, dönüşmezse veya geçersizse hata ver
+    if price_str != "":
+        try:
+            price = float(price_str)
+        except:
+            tkinter.messagebox.showerror(title="Geçersiz değerler.",
+                                         message="Lütfen bütün alanlara geçerli değerler giriniz.")
+            return
+
+        if price < 0:
+            tkinter.messagebox.showerror(title="Geçersiz değerler.", message="Fiyat negatif olamaz.")
+            return
+
+    stock_str = update_stock_var.get().strip()  # Stok adedini al
+
+    # Stok adedi boş değilse sayıya dönüştür, dönüşmezse veya geçersizse hata ver
+    if stock_str != "":
+        try:
+            stock = int(stock_str)
+        except:
+            tkinter.messagebox.showerror(title="Geçersiz değerler.",
+                                         message="Lütfen bütün alanlara geçerli değerler giriniz.")
+            return
+
+        if stock < 0:
+            tkinter.messagebox.showerror(title="Geçersiz değerler.", message="Stok adedi negatif olamaz.")
+            return
+
+    # Kalan verileri al
+    title = update_title_var.get().strip()
+    category = update_category_var.get().strip()
+
+    to_update = {}  # Güncellenecek veriler
+
+    # Eğer kitap ismi boş değilse verilere ekle
+    if title != "":
+        to_update["title"] = title
+
+    # Eğer kategori boş değilse verilere ekle
+    if category != "":
+        to_update["category"] = category
+
+    # Eğer fiyat boş değilse verilere ekle
+    if price_str != "":
+        to_update["price"] = price
+
+    # Eğer stok adedi boş değilse verilere ekle
+    if stock_str != "":
+        to_update["stock"] = stock
+
+    # Eğer hiçbir veri değiştirilmediyse hata ver
+    if len(to_update) == 0:
+        tkinter.messagebox.showerror(title="Geçersiz değerler.", message="Herhangi bir veri değişmedi.")
+        return
+
+    # Kitabı veritabanında güncelle ve bilgi mesajı göster
+    books_db.update_one({"upc": upc}, {"$set": to_update})
+    tkinter.messagebox.showinfo(title="Güncellendi.", message="Kitap başarıyla güncellendi.")
+
+
+# Kitap sil
+def delete_book():
+    global borrowed_db
+    global books_db
+    global delete_var
+
+    upc = delete_var.get().strip()  # UPC kodunu al
+
+    # Eğer UPC kodu boşsa hata ver
+    if upc == "":
+        tkinter.messagebox.showerror(title="Geçersiz değerler.",
+                                     message="Lütfen bütün alanlara geçerli değerler giriniz.")
+        return
+
+    upcs = [i["upc"] for i in books_db.find({}, {"upc": 1, "_id": 0})]  # Bütün UPC kodlarını al
+
+    # Eğer girilen UPC'ye sahip kitap yoksa hata ver
+    if upc not in upcs:
+        tkinter.messagebox.showerror(title="Geçersiz değerler.",
+                                     message="Girilen UPC koduna sahip bir kitap bulunamadı.")
+        return
+
+    # Kitabı veritabanından sil ve bilgi mesajı göster
+    borrowed_db.delete_many({"upc": upc})
+    books_db.delete_one({"upc": upc})
+    tkinter.messagebox.showinfo(title="Silindi.", message="Kitap başarıyla silindi.")
+
+
+# Kullanıcı ekle
+def add_user():
+    global users_db
+    global add_user_username_var
+    global add_user_fullname_var
+
+    # Kullanıcı ismini ve tam ismi al
+    username = add_user_username_var.get().strip()
+    fullname = add_user_fullname_var.get().strip()
+
+    # Eğer veriler boşsa hata ver
+    if username == "" or fullname == "":
+        tkinter.messagebox.showerror(title="Geçersiz değerler.",
+                                     message="Lütfen bütün alanlara geçerli değerler giriniz.")
+        return
+
+    usernames = [i["username"] for i in users_db.find({}, {"username": 1, "_id": 0})]  # Bütün kullanıcı isimlerini al
+
+    # Eğer bu kullanıcı adında başka biri varsa hata ver
+    if username in usernames:
+        tkinter.messagebox.showerror(title="Geçersiz değerler.", message="Kullanıcı zaten kayıtlı.")
+        return
+
+    # Kullanıcıyı veritabanına ekle ve bilgi mesajı göster
+    users_db.insert_one(
+        {"username": username, "fullname": fullname, "date": datetime.now().strftime("%m-%d-%Y %H:%M:%S")})
+    tkinter.messagebox.showinfo(title="Eklendi.", message="Kullanıcı başarıyla kaydedildi.")
+
+
+# Kullanıcı sil
+def delete_user():
+    global users_db
+    global delete_user_var
+    global borrowed_db
+
+    username = delete_user_var.get().strip()  # Kullanıcı adını al
+
+    # Eğer kullanıcı adı boşsa hata ver
+    if username == "":
+        tkinter.messagebox.showerror(title="Geçersiz değerler.",
+                                     message="Lütfen bütün alanlara geçerli değerler giriniz.")
+        return
+
+    usernames = [i["username"] for i in users_db.find({}, {"username": 1, "_id": 0})]  # Bütün kullanıcı adlarını al
+
+    # Eğer bu kullanıcı adına sahip bir kullanıcı yoksa hata ver
+    if username not in usernames:
+        tkinter.messagebox.showerror(title="Geçersiz değerler.",
+                                     message="Girilen kullanıcı adına sahip bir kullanıcı bulunamadı.")
+        return
+
+    # Kullanıcıyı veritabanından sil ve bilgi mesajı ver
+    borrowed_db.delete_many({"borrower": username})
+    users_db.delete_one({"username": username})
+    tkinter.messagebox.showinfo(title="Silindi.", message="Kullanıcı başarıyla silindi.")
+
+
+# Kitap ödünç ver
+def lend_book():
+    global borrowed_db
+    global books_db
+    global users_db
+    global lend_upc_var
+    global lend_borrower_var
+
+    # UPC kodunu ve ödünç alanın kullanıcı adını al
+    upc = lend_upc_var.get().strip()
+    borrower = lend_borrower_var.get().strip()
+
+    # Eğer veriler boşsa hata ver
+    if upc == "" or borrower == "":
+        tkinter.messagebox.showerror(title="Geçersiz değerler.",
+                                     message="Lütfen bütün alanlara geçerli değerler giriniz.")
+        return
+
+    upcs = [i["upc"] for i in books_db.find({}, {"upc": 1, "_id": 0})]  # Bütün UPC kodlarını al
+
+    # Eğer girilen UPC'ye sahip kitap yoksa hata ver
+    if upc not in upcs:
+        tkinter.messagebox.showerror(title="Geçersiz değerler.",
+                                     message="Girilen UPC koduna sahip bir kitap bulunamadı.")
+        return
+
+    usernames = [i["username"] for i in users_db.find({}, {"username": 1, "_id": 0})]  # Bütün kullanıcı adları al
+
+    # Eğer bu kullanıcı adına sahip bir kullanıcı yoksa hata ver
+    if borrower not in usernames:
+        tkinter.messagebox.showerror(title="Geçersiz değerler.",
+                                     message="Girilen kullanıcı adına sahip bir kullanıcı bulunamadı.")
+        return
+
+    users_books = [i["upc"] for i in borrowed_db.find({"borrower": borrower},
+                                                      {"upc": 1, "_id": 0})]  # Kullanıcın ödünç aldığı kitapları al
+
+    # Eğer kullanıcı zaten bu kitabı ödünç aldıysa hata ver
+    if upc in users_books:
+        tkinter.messagebox.showerror(title="Geçersiz değerler.",
+                                     message="Kullanıcı bu kitabın bir kopyasını zaten ödünç almış.")
+        return
+
+    quantity = books_db.find_one({"upc": upc}, {"stock": 1, "_id": 0})["stock"]  # Kitabın stok adedini al
+
+    # Eğer yeterli stok kalmadıysa hata ver
+    if quantity <= 0:
+        tkinter.messagebox.showerror(title="Geçersiz değerler.", message="Kitap yeterli stoğa sahip değil.")
+        return
+
+    # Ödünç alma operasyonunu veritabanına ekle, kitap stok adedini güncelle ve bilgi mesajı ver
+    borrowed_db.insert_one({"borrower": borrower, "upc": upc, "date": datetime.now().strftime("%m-%d-%Y %H:%M:%S")})
+    books_db.update_one({"upc": upc}, {"$set": {"stock": quantity - 1}})
+    tkinter.messagebox.showinfo(title="Ödünç verildi.", message="Kitap başarıyla kullanıcıya ödünç verildi.")
+
+
+# Ödünç verilen kitabı geri al
+def return_book():
+    global books_db
+    global borrowed_db
+    global return_var
+
+    id = return_var.get().strip()  # Ödünç ID'sini al
+
+    # Eğer ID boşsa hata ver
+    if id == "":
+        tkinter.messagebox.showerror(title="Geçersiz değerler.",
+                                     message="Lütfen bütün alanlara geçerli değerler giriniz.")
+        return
+
+    ids = [str(i["_id"]) for i in borrowed_db.find({}, {"_id": 1})]  # Bütün ödünç IDlerini al
+
+    # Eğer bu ID'ye sahip bir operasyon yoksa hata ver
+    if id not in ids:
+        tkinter.messagebox.showerror(title="Geçersiz değerler.",
+                                     message="Bu ID'ye sahip bir ödünç verme operasyonu bulunamadı.")
+        return
+
+    # Kitap UPC kodunu al, kitabın stok adedini al, operasyonu sil, stok adedini güncelle ve bilgi mesajını göster
+    upc_of_the_book = borrowed_db.find_one({"_id": ObjectId(id)}, {"upc": 1, "_id": 0})["upc"]
+    quantity = books_db.find_one({"upc": upc_of_the_book}, {"stock": 1, "_id": 0})["stock"]
+    borrowed_db.delete_one({"_id": ObjectId(id)})
+    books_db.update_one({"upc": upc_of_the_book}, {"$set": {"stock": quantity + 1}})
+    tkinter.messagebox.showinfo(title="Geri alındı.", message="Kitap başarıyla geri alındı.")
+
+
+# Eğer kod direkt çalıştırıldıysa programı başlat
+if __name__ == "__main__":
+    start()
